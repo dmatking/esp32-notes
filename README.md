@@ -52,7 +52,7 @@ CONFIG_ESP_HOSTED_NIMBLE_HCI_VHCI=y
 
 ### C6 Co-processor Firmware
 
-Waveshare boards ship with C6 firmware v0.0.0 which does not support Bluetooth. The correct firmware (`slave_fw`) must be flashed once manually:
+Waveshare boards have shipped with C6 firmware v0.0.0 which does not support Bluetooth — check the C6 firmware version on first boot, as this may have been updated in later production runs. If the version is too old, flash the correct firmware manually:
 
 ```bash
 esptool.py write_flash 0x310000 slave_fw.bin
