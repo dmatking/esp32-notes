@@ -8,6 +8,8 @@ Practical notes on ESP32 variants — initialization quirks, peripheral setup, a
 
 Boards like the Waveshare ESP32-P4-WIFI6-Touch-LCD-4B pair an ESP32-P4 application processor with an ESP32-C6 co-processor that handles WiFi and Bluetooth via SDIO using the `esp_hosted` library.
 
+> **New to the P4+C6 combo?** See [p4-c6-wifi-starter](https://github.com/dmatking/p4-c6-wifi-starter) — a minimal, heavily-annotated WiFi example that walks through the architecture and init sequence step by step.
+
 ### Radio Initialization Order
 
 The initialization sequence is strict — `esp_hosted` must be set up before anything else touches the network stack:
