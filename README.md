@@ -10,6 +10,12 @@ Boards like the Waveshare ESP32-P4-WIFI6-Touch-LCD-4B pair an ESP32-P4 applicati
 
 > **New to the P4+C6 combo?** See [esp32-p4-wifi-starter](https://github.com/dmatking/esp32-p4-wifi-starter) — a minimal, heavily-annotated WiFi example that walks through the architecture and init sequence step by step.
 
+**Silicon revision:** All current P4 hardware is v1.0 or v1.3 — not P4X (v3.x). Any BSP or example that requires v3.x minimum must be adapted. Required config:
+
+```
+CONFIG_ESP32P4_SELECTS_REV_LESS_THAN_V3=y
+```
+
 ### Radio Initialization Order
 
 The initialization sequence is strict — `esp_hosted` must be set up before anything else touches the network stack:
@@ -118,6 +124,44 @@ The P4's PPA (Pixel Processing Accelerator) handles buffer copies asynchronously
 
 This lets the CPU render the next frame while hardware handles the display copy.
 
+**PPA hardware rotation:** PPA can also rotate frames 90° CW in hardware — useful for landscape-source → portrait-display pipelines (e.g., decode a landscape JPEG, rotate in-place before the display copy).
+
+### Hardware JPEG Decode
+
+The P4 has an onboard JPEG decoder. Key constraints:
+
+- Frame dimensions must be divisible by 8 (DMA alignment requirement)
+- Decoded output goes directly into a PSRAM buffer — zero copy into the display framebuffer is possible
+- Sustained ~30 fps to a 720×720 MIPI-DSI display is achievable with hardware decode + PPA double-buffer
+
+Software JPEG decode (e.g., `tjpgd` on ESP32-S3) tops out around 12 fps at 320×240 for comparison.
+
+### Audio Codecs
+
+**ES8311** (used in webradio and similar boards):
+- I2C address: `0x18`
+- Requires a separate I2S TX channel setup alongside the I2C config
+- Mono codec
+
+**ES8388** (M5Stack Tab5):
+- Stereo codec
+- Use the BSP (`espressif/esp-bsp`) rather than writing a raw driver: `bsp_audio_codec_speaker_init()`, `bsp_audio_codec_microphone_init()`
+
+### GT911 Capacitive Touchscreen
+
+- I2C address: `0x5D`
+- Use a direct I2C driver — not the BSP abstraction
+- Supports tap regions and swipe gestures (up/down/left/right)
+
+### A/V Sync via I2S DMA Counter
+
+When combining audio playback with video display, use the I2S DMA sample counter as the ground truth for elapsed time — not `esp_timer_get_time()` or wall clock.
+
+- I2S consumes samples at exactly the configured sample rate (e.g., 16 kHz)
+- Drive video frame requests from this counter: fetch the frame that corresponds to current audio position
+- Sync is "by construction" — no drift accumulation is possible
+- If video rendering falls behind, silence appears rather than audio/video desync
+
 ### Console / Logging Configuration
 
 The Waveshare P4 board uses **UART as primary console** with USB JTAG as secondary. The Espressif EV board uses USB_SERIAL_JTAG as primary. Using the EV board sdkconfig on Waveshare hardware produces no application logs — make sure your sdkconfig.defaults sets:
@@ -183,6 +227,92 @@ I2C works reliably at 1 MHz with short cables; internal pull-ups are sufficient 
 
 ---
 
+## WiFi Streaming Patterns
+
+### HTTP Pull vs TCP Push
+
+**HTTP pull** (preferred): The client requests each frame/audio chunk on demand; the server does not push.
+- Tolerates WiFi hiccups gracefully — a missed frame is retried on the next request cycle
+- A/V sync is simpler: lock to the audio counter and request the video frame at that timestamp
+- Used in: esp32-p4-webradio, m5stack-tab5-video-stream
+
+**TCP push**: Server sends frames length-prefixed over a persistent TCP connection.
+- Supports multiple simultaneous clients
+- Hiccup recovery is more complex — a dropped connection requires reconnect and resync
+- Used in: video-stream (legacy ESP32-S3 path)
+
+For new projects, prefer HTTP pull unless multiple simultaneous viewers are required.
+
+---
+
+## BLE Keyboard Host (NimBLE)
+
+Notes for projects using `esp32-ble-kbd-host` or similar BLE HID host implementations.
+
+### Single Persistent Task
+
+Use one persistent `kbd_main_task` covering scan, connect, and reconnect — do not split these into separate tasks with hand-offs. A multi-task design misses BOOT button presses that arrive during the task transition window.
+
+### Lightweight Reconnect
+
+Keep the device object alive across a disconnect — do not free and recreate it. `esp_ble_hidh_dev_reconnect()` can then skip full GATT rediscovery on reconnect, which is significantly faster than a full pairing cycle.
+
+### Re-pair from Any State
+
+`start_pairing()` must be callable from any state, including during a reconnect retry loop. If it isn't, holding the BOOT button during reconnect will be silently ignored.
+
+### P4 Note
+
+On ESP32-P4, BLE routes through the ESP32-C6 co-processor via VHCI over the same SDIO link as WiFi. The NimBLE config is the same as noted above in the Bluetooth section.
+
+---
+
+## wolfSSH
+
+Notes for projects using `esp32-wolfssh-client` or wolfSSH directly.
+
+### Session Setup Order
+
+The setup sequence is strict — steps cannot be reordered:
+
+```
+wolfSSH_Init()          // once at startup, not per-session
+wolfSSH_CTX_new()
+wolfSSH_new()
+connect (TCP)
+wolfSSH_set_channel_type(SHELL)
+wolfSSH_SendTerminalSize() / PTY request
+wolfSSH_accept()        // completes handshake
+// read/write loop
+```
+
+Getting the order wrong produces cryptic handshake failures.
+
+### Clear Socket Timeouts After Handshake
+
+Set socket timeouts during connect to avoid hanging on a dead server, but **clear them after the handshake completes**. Leaving timeouts active on the session socket causes spurious `EAGAIN` mid-session during legitimate pauses in output.
+
+```c
+// After wolfSSH_accept() succeeds:
+struct timeval tv = {0, 0};
+setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+```
+
+### wolfSSL user_settings.h Override (P4)
+
+The default wolfSSL `user_settings.h` causes compile errors or silent runtime failures on ESP32-P4. Override it per-project — copy a working `user_settings.h` from `esp32-wolfssh-client` rather than deriving from scratch.
+
+### One Session at a Time
+
+Only one SSH session can be active at a time. Call `disconnect()` and wait for the disconnect callback before opening a new session, or the next `wolfSSH_accept()` returns `ESP_ERR_INVALID_STATE`.
+
+### Keyboard Input Requires a Queue
+
+wolfSSH's write call blocks. Keyboard input must arrive via a thread-safe queue — do not call `wolfSSH_stream_send()` directly from a GPIO ISR or a different task without a queue in between.
+
+---
+
 ## Cross-Variant
 
 ### FreeRTOS Tick Rate
@@ -228,4 +358,4 @@ ESP_ERROR_CHECK(ret);
 ### ESP-IDF Version Notes
 
 - **Minimum for P4 + MIPI-DSI support:** v5.3
-- **Tested:** v5.5.1
+- **Tested:** v5.5.1, v5.5.3
